@@ -1,0 +1,412 @@
+---
+title: "Análisis estadístico exploratorio del dataset Breast Cancer Wisconsin"
+author: "Daniel Catalán Piera"
+date: "`r format(Sys.Date(), '%d/%m/%Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.align = "center", fig.width = 7, fig.height = 4.5)
+set.seed(123)
+```
+
+# Objetivo
+
+El conjunto de datos Breast Cancer Wisconsin (Diagnostic) recoge medidas
+morfológicas de núcleos celulares obtenidas a partir de imágenes de punción
+aspirativa con aguja fina de masas mamarias. Cada caso está etiquetado como
+benigno (`B`) o maligno (`M`).
+
+El objetivo de este documento es construir un flujo de análisis estadístico
+reproducible que:
+
+1. Describa las variables y controle su calidad.
+2. Decida de forma automática qué contraste de hipótesis corresponde a cada
+   comparación, en función de la normalidad y del número de grupos.
+3. Corrija por comparaciones múltiples, ya que se realizan decenas de
+   contrastes simultáneos.
+4. Explore la correlación entre variables y ajuste un modelo de regresión
+   logística para discriminar entre tumores benignos y malignos.
+
+La idea es que las funciones se apliquen a cualquier data frame con una
+variable de agrupación, no solo a este.
+
+# Paquetes y datos
+
+```{r paquetes}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
+library(ggplot2)
+library(nortest)
+library(rstatix)
+```
+
+Los datos deben estar en `data/dataBreastCancer.txt` dentro del proyecto. Se
+usa una ruta relativa para que el análisis funcione en cualquier ordenador.
+
+```{r carga}
+ruta <- file.path("data", "dataBreastCancer.txt")
+
+if (!file.exists(ruta)) {
+  stop("No se encuentra el archivo de datos. Consulta el README del repositorio.")
+}
+
+datos <- read.csv(ruta, sep = "")
+
+dim(datos)
+```
+
+# Estructura y control de calidad
+
+```{r estructura}
+str(datos)
+```
+
+```{r valores-perdidos}
+# Recuento de valores perdidos por variable
+map_int(datos, ~ sum(is.na(.x))) %>%
+  keep(~ .x > 0)
+```
+
+`diagnosis` es la única variable cualitativa; el resto son cuantitativas
+continuas. Se convierte a factor fijando `B` como nivel de referencia, lo que
+más adelante hará que la regresión logística modele la probabilidad de que el
+tumor sea maligno.
+
+```{r factor}
+datos$diagnosis <- factor(datos$diagnosis, levels = c("B", "M"))
+table(datos$diagnosis)
+```
+
+## Detección de valores atípicos
+
+Se marcan los valores atípicos siguiendo el criterio del rango intercuartílico
+(más de 1,5 RIC por encima del tercer cuartil o por debajo del primero).
+
+```{r outliers}
+datos_marcados <- datos %>%
+  mutate(across(.cols = where(is.numeric),
+                .fns  = ~ is_outlier(.x),
+                .names = "out_{col}"))
+
+n_outliers <- datos_marcados %>%
+  summarise(across(starts_with("out_"), sum)) %>%
+  tidyr::pivot_longer(everything(),
+                      names_to = "variable", values_to = "n_atipicos") %>%
+  arrange(desc(n_atipicos))
+
+head(n_outliers, 10)
+```
+
+```{r conteo-casos-completos}
+casos_sin_atipicos <- datos_marcados %>%
+  filter(if_all(starts_with("out_"), ~ .x == FALSE)) %>%
+  nrow()
+
+casos_sin_atipicos
+```
+
+Eliminar todos los casos con algún valor atípico dejaría fuera una parte muy
+grande de la muestra. Estos valores no son errores de medida: son tumores
+grandes o irregulares, es decir, precisamente la señal biológica de interés.
+Por tanto **se conserva la muestra completa** y la detección de atípicos se
+mantiene solo como control de calidad. Esta decisión se documenta aquí porque
+condiciona todo lo que viene después.
+
+# Descriptivos
+
+Función que resume cualquier variable según sea cuantitativa o cualitativa.
+
+```{r descriptivos}
+formato_hibrido <- function(x) {
+  if (is.na(x)) return(NA_character_)
+  if (abs(x) < 0.001 || abs(x) >= 1e4) {
+    format(x, scientific = TRUE, digits = 4)
+  } else {
+    format(round(x, 4), nsmall = 4)
+  }
+}
+
+describir_variable <- function(nombre, df) {
+  columna <- df[[nombre]]
+
+  if (is.numeric(columna)) {
+    tibble(variable   = nombre,
+           tipo       = "cuantitativa",
+           media      = formato_hibrido(mean(columna, na.rm = TRUE)),
+           mediana    = formato_hibrido(median(columna, na.rm = TRUE)),
+           desviacion = formato_hibrido(sd(columna, na.rm = TRUE)),
+           IQR        = formato_hibrido(IQR(columna, na.rm = TRUE)))
+  } else {
+    frecuencias <- table(columna)
+    proporciones <- prop.table(frecuencias)
+    tibble(variable   = nombre,
+           tipo       = "cualitativa",
+           categoria  = names(frecuencias),
+           frecuencia = as.integer(frecuencias),
+           porcentaje = paste0(sprintf("%.2f", as.numeric(proporciones) * 100), "%"))
+  }
+}
+
+descriptivos <- map_dfr(names(datos), describir_variable, df = datos)
+head(descriptivos, 12)
+```
+
+Descriptivos por grupo diagnóstico de las variables medias principales:
+
+```{r descriptivos-grupo}
+datos %>%
+  group_by(diagnosis) %>%
+  summarise(across(ends_with("_mean"),
+                   list(media = ~ round(mean(.x, na.rm = TRUE), 3),
+                        sd    = ~ round(sd(.x, na.rm = TRUE), 3)),
+                   .names = "{.col}_{.fn}"),
+            .groups = "drop") %>%
+  select(diagnosis, starts_with("radius"), starts_with("texture"),
+         starts_with("smoothness"))
+```
+
+# Normalidad
+
+La prueba de Lilliefors (Kolmogorov-Smirnov con parámetros estimados) es
+adecuada aquí porque el tamaño muestral supera los 50 casos.
+
+Un matiz importante: los contrastes de comparación de medias asumen normalidad
+**dentro de cada grupo**, no en la variable global. Por eso la normalidad se
+evalúa por grupo.
+
+```{r normalidad}
+vars_cuantitativas <- names(datos)[map_lgl(datos, is.numeric)]
+
+es_normal <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) < 5 || length(unique(x)) == 1) return(NA)
+  lillie.test(x)$p.value >= 0.05
+}
+
+normalidad_por_grupo <- map_dfr(vars_cuantitativas, function(v) {
+  normal_en_todos <- datos %>%
+    group_by(diagnosis) %>%
+    summarise(normal = es_normal(.data[[v]]), .groups = "drop") %>%
+    pull(normal) %>%
+    all(na.rm = TRUE)
+
+  tibble(variable = v,
+         normal_en_ambos_grupos = normal_en_todos,
+         enfoque = if (isTRUE(normal_en_todos)) "paramétrico" else "no paramétrico")
+})
+
+count(normalidad_por_grupo, enfoque)
+```
+
+# Comparación entre grupos
+
+La función elige el contraste adecuado: t de Student o U de Mann-Whitney con
+dos grupos, ANOVA o Kruskal-Wallis con más de dos.
+
+```{r comparaciones}
+comparar <- function(variable, grupo, df) {
+  x <- df[[variable]]
+  g <- as.factor(df[[grupo]])
+
+  completos <- !is.na(x) & !is.na(g)
+  x <- x[completos]
+  g <- droplevels(g[completos])
+
+  if (nlevels(g) < 2) return(NULL)
+
+  parametrico <- normalidad_por_grupo %>%
+    filter(variable == !!variable) %>%
+    pull(normal_en_ambos_grupos) %>%
+    isTRUE()
+
+  if (nlevels(g) == 2) {
+    if (parametrico) {
+      prueba <- t.test(x ~ g); test <- "t de Student"
+    } else {
+      prueba <- wilcox.test(x ~ g); test <- "U de Mann-Whitney"
+    }
+    p <- prueba$p.value
+  } else {
+    if (parametrico) {
+      prueba <- aov(x ~ g); test <- "ANOVA"
+      p <- summary(prueba)[[1]][["Pr(>F)"]][1]
+    } else {
+      prueba <- kruskal.test(x ~ g); test <- "Kruskal-Wallis"
+      p <- prueba$p.value
+    }
+  }
+
+  tibble(variable = variable, test = test, p_valor = p)
+}
+
+resultados <- map_dfr(vars_cuantitativas, comparar,
+                      grupo = "diagnosis", df = datos)
+```
+
+Al realizar un contraste por variable, una parte de los resultados
+significativos aparecería solo por azar. Se aplica la corrección de
+Benjamini-Hochberg, que controla la tasa de falsos descubrimientos.
+
+```{r correccion-multiple}
+resultados <- resultados %>%
+  mutate(p_ajustado = p.adjust(p_valor, method = "BH"),
+         significativo = p_ajustado < 0.05) %>%
+  arrange(p_ajustado)
+
+resultados %>%
+  mutate(across(c(p_valor, p_ajustado), ~ signif(.x, 3))) %>%
+  head(10)
+```
+
+```{r resumen-significativos}
+sum(resultados$significativo, na.rm = TRUE)
+```
+
+# Correlación entre variables cuantitativas
+
+Se calcula Pearson cuando ambas variables son normales y Spearman en caso
+contrario, recorriendo cada par una sola vez.
+
+```{r correlaciones}
+normal_global <- set_names(map_lgl(datos[vars_cuantitativas], ~ isTRUE(es_normal(.x))),
+                           vars_cuantitativas)
+
+pares <- combn(vars_cuantitativas, 2, simplify = FALSE)
+
+correlaciones <- map_dfr(pares, function(par) {
+  v1 <- par[1]; v2 <- par[2]
+  metodo <- if (normal_global[[v1]] && normal_global[[v2]]) "pearson" else "spearman"
+  prueba <- suppressWarnings(cor.test(datos[[v1]], datos[[v2]], method = metodo))
+
+  tibble(variable_1 = v1,
+         variable_2 = v2,
+         metodo = metodo,
+         r = unname(round(prueba$estimate, 4)),
+         p_valor = prueba$p.value)
+}) %>%
+  mutate(p_ajustado = p.adjust(p_valor, method = "BH"))
+
+correlaciones %>%
+  arrange(desc(abs(r))) %>%
+  select(variable_1, variable_2, metodo, r) %>%
+  head(10)
+```
+
+Las correlaciones más altas se dan entre variables que miden lo mismo por
+distintas vías (radio, perímetro y área describen todas el tamaño del núcleo).
+Esto es colinealidad y hay que tenerlo en cuenta al elegir predictores para el
+modelo.
+
+```{r grafico-correlacion}
+mejor_par <- correlaciones %>% arrange(desc(abs(r))) %>% slice(1)
+
+ggplot(datos, aes(x = .data[[mejor_par$variable_1]],
+                  y = .data[[mejor_par$variable_2]])) +
+  geom_point(alpha = 0.5, colour = "steelblue") +
+  geom_smooth(method = "lm", colour = "firebrick", se = TRUE) +
+  labs(title = paste("Relación entre", mejor_par$variable_1, "y", mejor_par$variable_2),
+       subtitle = paste0(mejor_par$metodo, ", r = ", mejor_par$r),
+       x = mejor_par$variable_1, y = mejor_par$variable_2) +
+  theme_minimal()
+```
+
+```{r boxplot}
+ggplot(datos, aes(x = diagnosis, y = radius_mean, fill = diagnosis)) +
+  geom_boxplot(alpha = 0.85, outlier.alpha = 0.4) +
+  scale_fill_manual(values = c(B = "steelblue", M = "tomato"),
+                    labels = c(B = "Benigno", M = "Maligno")) +
+  labs(title = "Radio medio del núcleo según diagnóstico",
+       x = NULL, y = "Radio medio", fill = "Diagnóstico") +
+  theme_minimal()
+```
+
+# Regresión logística
+
+Se ajusta un modelo para estimar la probabilidad de malignidad. Los
+predictores se eligen buscando que describan aspectos distintos del núcleo
+(tamaño, textura y regularidad del contorno) para evitar la colinealidad
+detectada en el apartado anterior.
+
+Los datos se dividen en entrenamiento y prueba, de modo que el rendimiento se
+evalúe sobre casos que el modelo no ha visto.
+
+```{r particion}
+n <- nrow(datos)
+indices_entrenamiento <- sample(seq_len(n), size = round(0.7 * n))
+
+entrenamiento <- datos[indices_entrenamiento, ]
+prueba <- datos[-indices_entrenamiento, ]
+
+c(entrenamiento = nrow(entrenamiento), prueba = nrow(prueba))
+```
+
+```{r modelo}
+modelo <- glm(diagnosis ~ radius_mean + texture_mean + smoothness_mean,
+              data = entrenamiento, family = binomial)
+
+summary(modelo)
+```
+
+Los coeficientes se interpretan mejor como odds ratio:
+
+```{r odds-ratio}
+tibble(termino = names(coef(modelo)),
+       odds_ratio = round(exp(coef(modelo)), 4),
+       IC_inferior = round(exp(confint.default(modelo)[, 1]), 4),
+       IC_superior = round(exp(confint.default(modelo)[, 2]), 4))
+```
+
+## Evaluación sobre el conjunto de prueba
+
+```{r evaluacion}
+probabilidades <- predict(modelo, newdata = prueba, type = "response")
+prediccion <- factor(ifelse(probabilidades > 0.5, "M", "B"), levels = c("B", "M"))
+
+matriz_confusion <- table(Observado = prueba$diagnosis, Predicho = prediccion)
+matriz_confusion
+```
+
+```{r metricas}
+VN <- matriz_confusion["B", "B"]; FP <- matriz_confusion["B", "M"]
+FN <- matriz_confusion["M", "B"]; VP <- matriz_confusion["M", "M"]
+
+# Área bajo la curva ROC calculada a partir del estadístico de Mann-Whitney
+auc <- function(probabilidades, clase_real, positivo = "M") {
+  rangos <- rank(probabilidades)
+  n_pos <- sum(clase_real == positivo)
+  n_neg <- sum(clase_real != positivo)
+  (sum(rangos[clase_real == positivo]) - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
+}
+
+tibble(exactitud     = round((VP + VN) / sum(matriz_confusion), 4),
+       sensibilidad  = round(VP / (VP + FN), 4),
+       especificidad = round(VN / (VN + FP), 4),
+       AUC           = round(auc(probabilidades, prueba$diagnosis), 4))
+```
+
+# Conclusiones
+
+- Prácticamente todas las variables morfológicas difieren de forma
+  significativa entre tumores benignos y malignos, incluso después de corregir
+  por comparaciones múltiples.
+- Las variables de tamaño (radio, perímetro y área) están fuertemente
+  correlacionadas entre sí, por lo que no aportan información independiente a
+  un modelo.
+- Con solo tres predictores, la regresión logística separa bien ambos grupos
+  sobre datos no usados en el ajuste, lo que indica que la morfología nuclear
+  contiene señal diagnóstica clara.
+
+# Información de la sesión
+
+```{r sesion}
+sessionInfo()
+```
