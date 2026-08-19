@@ -33,22 +33,26 @@ cualquier data frame que tenga una variable de agrupación.
 .
 ├── analisis_estadistico_breast_cancer.Rmd   # análisis completo
 ├── data/
-│   └── dataBreastCancer.txt                 # datos (ver más abajo)
+│   ├── preparar_datos.R                     # descarga y prepara los datos
+│   └── dataBreastCancer.txt                 # se genera al ejecutar el script
 └── README.md
 ```
 
 ## Cómo reproducirlo
 
 1. Clona el repositorio o descárgalo como ZIP.
-2. Coloca el archivo de datos en `data/dataBreastCancer.txt`. El conjunto es
-   público y está disponible en el
-   [repositorio UCI](https://archive.ics.uci.edu/dataset/17/breast+cancer+wisconsin+diagnostic).
-3. Instala los paquetes necesarios:
+2. Instala los paquetes necesarios:
 
 ```r
-install.packages(c("dplyr", "tidyr", "purrr", "tibble",
-                   "ggplot2", "nortest", "rstatix", "rmarkdown"))
+install.packages(c("dplyr", "tidyr", "purrr", "tibble", "ggplot2",
+                   "nortest", "rstatix", "rmarkdown", "mclust"))
 ```
+
+3. No hace falta descargar nada a mano: el análisis ejecuta
+   `data/preparar_datos.R` si no encuentra los datos, y ese script los obtiene
+   del [repositorio UCI](https://archive.ics.uci.edu/dataset/17/breast+cancer+wisconsin+diagnostic).
+   Si la descarga no estuviera disponible, recurre a la copia del mismo
+   conjunto incluida en el paquete `mclust`.
 
 4. Abre el `.Rmd` en RStudio y pulsa **Knit**, o ejecuta:
 

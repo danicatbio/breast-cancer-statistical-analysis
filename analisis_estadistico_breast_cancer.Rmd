@@ -49,14 +49,16 @@ library(nortest)
 library(rstatix)
 ```
 
-Los datos deben estar en `data/dataBreastCancer.txt` dentro del proyecto. Se
-usa una ruta relativa para que el análisis funcione en cualquier ordenador.
+Los datos se guardan en `data/dataBreastCancer.txt`. Si el archivo no está, el
+script `data/preparar_datos.R` lo descarga del repositorio UCI y lo deja
+preparado, de modo que el análisis se puede reproducir en cualquier ordenador
+sin buscar nada a mano.
 
 ```{r carga}
 ruta <- file.path("data", "dataBreastCancer.txt")
 
 if (!file.exists(ruta)) {
-  stop("No se encuentra el archivo de datos. Consulta el README del repositorio.")
+  source(file.path("data", "preparar_datos.R"))
 }
 
 datos <- read.csv(ruta, sep = "")
